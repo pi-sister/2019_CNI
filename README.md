@@ -5,8 +5,8 @@ Schirmer, Markus D., et al. "Neuropsychiatric disease classification using funct
 
 https://www.sciencedirect.com/science/article/abs/pii/S1361841521000189
 
-# 2019_CNI_TrainingRelease
-Test data (private) for Connectomics in NeuroImaging - Transfer Learning Challenge (CNI-TLC). For more details, see http://miccai.brainconnectivity.net
+# 2019_CNI_TestRelease
+Test data for Connectomics in NeuroImaging - Transfer Learning Challenge (CNI-TLC). For more details, see http://miccai.brainconnectivity.net
 
 # Challenge Data
 
