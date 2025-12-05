@@ -15,6 +15,7 @@ The module exposes:
 The GA uses binary encoding over the candidate node list (1=remove node). Fitness = subjects_fixed - penalty * n_removed.
 """
 
+
 import random
 import time
 from typing import Dict, List, Tuple, Iterable, Set
@@ -22,6 +23,9 @@ import pickle
 import os
 import networkx as nx
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 # ------------------------- Utils -------------------------
 
@@ -78,7 +82,7 @@ class Evaluator:
                     gcopy.remove_node(node)
             # After removal, check connectedness
             # If graph has <2 nodes, treat as not fixed
-            if gcopy.number_of_nodes() >= 1 and nx.is_connected(gcopy):
+            if gcopy.number_of_nodes() >= 2 and nx.is_connected(gcopy):
                 n_fixed += 1
             n_subj += 1
 
@@ -156,12 +160,18 @@ def run_ga(
     pop_size: int = 200,
     gens: int = 300,
     max_removed: int = 10,
+    min_removed: int = 6,
     p_mut: float = 0.02,
     elitism: int = 2,
     penalty: float = 0.3,
     tournament_k: int = 3,
     seed: int = None,
     verbose: bool = True,
+    use_parallel: bool = False,        # NEW: enable parallel evaluation
+    use_greedy_init: bool = True,      # NEW: enable greedy initialization
+    use_adaptive_mut: bool = True,     # NEW: enable adaptive mutation
+    early_stop_patience: int = 30,     # NEW: early stopping patience
+    n_workers: int = None,             # NEW: number of parallel workers
 ):
     """Main GA runner!
 
@@ -177,15 +187,45 @@ def run_ga(
         raise ValueError("No candidate nodes provided")
 
     evaluator = Evaluator(broken_subject_graphs)
-    population = [individual_random(n_candidates, max_removed) for _ in range(pop_size)]
+    fitness_cache = {}  # For fitness_cached function
+    
+    # === GREEDY INITIALIZATION ===
+    if use_greedy_init:
+        if verbose:
+            print(f"Using greedy initialization for {min(pop_size // 2, 20)} individuals...")
+        n_greedy = min(pop_size // 2, 20)  # Half population or 20, whichever is smaller
+        population = greedy_init(
+            candidates, 
+            broken_subject_graphs, 
+            max_removed,
+            min_removed=min_removed,
+            n_greedy=n_greedy,
+            n_test_nodes=min(30, len(candidates))
+        )
+        # Fill rest with random
+        while len(population) < pop_size:
+            population.append(individual_random(n_candidates, max_removed))
+    else:
+        population = [individual_random(n_candidates, max_removed) for _ in range(pop_size)]
 
-    # Precompute fitnesses
-    fitnesses = []
-    for ind in population:
-        subset = decode_individual(ind, candidates)
-        n_fixed, n_subj = evaluator.evaluate_subset(subset)
-        fit = fitness_function(n_fixed, n_subj, len(subset), penalty)
-        fitnesses.append(fit)
+    # === PARALLEL EVALUATION (Initial) ===
+    if use_parallel:
+        if verbose:
+            print(f"Using parallel evaluation with {n_workers or 'auto'} workers...")
+        fitnesses = evaluate_population_parallel(
+            population, 
+            broken_subject_graphs, 
+            candidates, 
+            penalty, 
+            n_workers
+        )
+    else:
+        # Sequential evaluation
+        fitnesses = []
+        for ind in population:
+            subset = decode_individual(ind, candidates)
+            fit = fitness_cached(subset, evaluator, penalty, fitness_cache)
+            fitnesses.append(fit)
 
     best_overall = None
     best_fit = -1e9
@@ -193,10 +233,16 @@ def run_ga(
     start_time = time.time()
 
     for gen in range(1, gens + 1):
+        # === ADAPTIVE MUTATION ===
+        if use_adaptive_mut:
+            current_p_mut = adaptive_mutation(gen, gens, p_mut)
+        else:
+            current_p_mut = p_mut
+        
         new_pop = []
         new_fit = []
 
-        # keep top `elitism` individuals
+        # Keep top `elitism` individuals
         ranked = sorted(range(len(population)), key=lambda i: fitnesses[i], reverse=True)
         for i in ranked[:elitism]:
             new_pop.append(population[i].copy())
@@ -207,23 +253,22 @@ def run_ga(
             parent1 = tournament_selection(population, fitnesses, tournament_k)
             parent2 = tournament_selection(population, fitnesses, tournament_k)
             child1, child2 = crossover(parent1, parent2)
-            mutate(child1, p_mut, max_removed)
-            mutate(child2, p_mut, max_removed)
+            mutate(child1, current_p_mut, max_removed)  # Use adaptive mutation rate
+            mutate(child2, current_p_mut, max_removed)
 
             # evaluate children
             for child in (child1, child2):
                 if len(new_pop) >= pop_size:
                     break
                 subset = decode_individual(child, candidates)
-                n_fixed, n_subj = evaluator.evaluate_subset(subset)
-                fit = fitness_function(n_fixed, n_subj, len(subset), penalty)
+                fit = fitness_cached(subset, evaluator, penalty, fitness_cache)
                 new_pop.append(child)
                 new_fit.append(fit)
 
         population = new_pop
         fitnesses = new_fit
 
-        # update best
+        # Update best
         gen_best_idx = int(np.argmax(fitnesses))
         gen_best_fit = fitnesses[gen_best_idx]
         if gen_best_fit > best_fit:
@@ -232,13 +277,22 @@ def run_ga(
 
         fitness_history.append(best_fit)
 
+        # === EARLY STOPPING ===
+        if early_stop_patience > 0 and should_stop_early(fitness_history, early_stop_patience):
+            if verbose:
+                elapsed = time.time() - start_time
+                print(f"\nEarly stopping at generation {gen}/{gens} (no improvement for {early_stop_patience} gens)")
+                print(f"Best fitness: {best_fit:.4f}, Elapsed: {elapsed:.1f}s")
+            break
+
         if verbose and (gen % max(1, gens // 10) == 0 or gen == 1):
             elapsed = time.time() - start_time
-            print(f"Gen {gen}/{gens}  best_fit={best_fit:.4f}  elapsed={elapsed:.1f}s")
+            cache_info = f"cache={len(fitness_cache)}" if fitness_cache else f"eval_cache={len(evaluator.cache)}"
+            mut_info = f"p_mut={current_p_mut:.4f}" if use_adaptive_mut else ""
+            print(f"Gen {gen}/{gens}  best_fit={best_fit:.4f}  {mut_info}  {cache_info}  elapsed={elapsed:.1f}s")
 
     # Build top-k results from cache
     results = []
-    # Evaluate unique individuals in final population
     seen = set()
     for ind, fit in zip(population, fitnesses):
         subset = tuple(sorted(decode_individual(ind, candidates)))
@@ -246,7 +300,13 @@ def run_ga(
             continue
         seen.add(subset)
         n_fixed, n_subj = evaluator.evaluate_subset(subset)
-        results.append({'subset': subset, 'n_fixed': n_fixed, 'n_subjects': n_subj, 'n_removed': len(subset), 'fitness': fit})
+        results.append({
+            'subset': subset, 
+            'n_fixed': n_fixed, 
+            'n_subjects': n_subj, 
+            'n_removed': len(subset), 
+            'fitness': fit
+        })
 
     results = sorted(results, key=lambda x: (x['fitness'], x['n_fixed']), reverse=True)
 
@@ -262,8 +322,91 @@ def run_ga(
         'fitness_history': fitness_history,
         'top_results': results[:20],
         'evaluator_cache_size': len(evaluator.cache),
+        'fitness_cache_size': len(fitness_cache),
+        'generations_run': gen,  # Actual generations (may stop early)
     }
 
+
+def evaluate_individual_fitness(ind, evaluator, candidate_nodes, penalty):
+    """Helper function to evaluate a single individual's fitness."""
+    subset = decode_individual(ind, candidate_nodes)
+    n_fixed, n_subj = evaluator.evaluate_subset(subset)
+    return fitness_function(n_fixed, n_subj, len(subset), penalty)
+
+def evaluate_population_parallel(population, broken_subject_graphs, candidate_nodes, penalty, n_workers=None):
+    """Evaluate fitness for entire population in parallel using a shared Evaluator and threads."""
+    if n_workers is None:
+        n_workers = max(1, multiprocessing.cpu_count() - 1)
+    evaluator = Evaluator(broken_subject_graphs)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(evaluate_individual_fitness, ind, evaluator, candidate_nodes, penalty) 
+                   for ind in population]
+        results = [f.result() for f in futures]
+    return results
+
+# Initialize population with greedy solutions, not random
+def greedy_init(candidate_nodes, broken_subject_graphs, max_removed, min_removed=6, n_greedy=20, n_test_nodes=30):
+    """Start with best single-node removals.
+
+    Args:
+        candidate_nodes: list of candidate nodes
+        broken_subject_graphs: dict of subject graphs
+        max_removed: maximum number of nodes to remove
+        n_greedy: number of greedy initial solutions
+        n_test_nodes: number of candidate nodes to test in initialization (default: 30)
+    """
+    population = []
+    
+    # Score each node individually
+    node_scores = []
+    evaluator = Evaluator(broken_subject_graphs)
+    for node in candidate_nodes[:n_test_nodes]:  # Test top n_test_nodes
+        subset = frozenset([node])
+        n_fixed, _ = evaluator.evaluate_subset(subset)
+        node_scores.append((node, n_fixed))
+    
+    # Sort by effectiveness
+    node_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    # Build initial solutions from top nodes
+    for i in range(n_greedy):
+        size = random.randint(min_removed, max_removed)
+        # Take top nodes with some randomness
+        nodes = [node_scores[j % len(node_scores)][0] 
+                for j in range(i, i + size)]
+        # Create binary array for individual
+        ind = np.zeros(len(candidate_nodes), dtype=int)
+        for node in nodes:
+            idx = candidate_nodes.index(node)
+            ind[idx] = 1
+        population.append(ind)
+    
+    return population
+
+# Increase mutation rate if stuck
+def adaptive_mutation(generation, gens, base_mut=0.02):
+    """Increase mutation rate in later generations if not improving."""
+    if generation > gens * 0.7:  # Last 30%
+        return base_mut * 2
+    return base_mut
+
+# Stop if no improvement for N generations
+def should_stop_early(fitness_history, patience=20):
+    """Stop if best fitness hasn't improved in 'patience' generations."""
+    if len(fitness_history) < patience + 1:
+        return False
+    recent = fitness_history[-patience:]
+    return all(abs(f - recent[0]) < 1e-9 for f in recent)
+
+def fitness_cached(subset, evaluator, penalty, cache):
+    """Cache fitness values to avoid recomputation. Requires an Evaluator instance."""
+    key = frozenset(subset)
+    if key in cache:
+        return cache[key]
+    n_fixed, n_subj = evaluator.evaluate_subset(subset)
+    fit = fitness_function(n_fixed, n_subj, len(subset), penalty)
+    cache[key] = fit
+    return fit
 
 # ------------------------- main -------------------------
 if __name__ == '__main__':
